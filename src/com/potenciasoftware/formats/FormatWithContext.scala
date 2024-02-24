@@ -8,18 +8,26 @@ import FormatWithContext._
   * Given a source text and a sequence of contextual details tied to specific
   * positions in the source text, format the source text and include the context
   * details below each relevant line. The position in the source text and the
-  * the details will be connected with lines.
+  * details will be connected with drawn lines.
   *
   * @param maxColumn
-  *   The maximum column a line can reach before being wrapped
+  *   The maximum column a line of text can reach before being wrapped
   * @param detailGrouping
   *   How many individual source positions to show context for. If there are
   *   more positions for a given line, that line will be repeated with the
   *   additional context shown.
+  * @param blanksBetweenPositionPoints
+  *   How many blank lines should be added between context points that all
+  *   relate to the same position
+  * @param blanksBetweenPositionGroups
+  *   How many blank lines should be added between the detail groups of each
+  *   position
   */
 final case class FormatWithContext(
-  maxColumn: Int = 80,
-  detailGrouping: Int = 6,
+    maxColumn: Int = 80,
+    detailGrouping: Int = 6,
+    blanksBetweenPositionPoints: Int = 0,
+    blanksBetweenPositionGroups: Int = 1,
 ) {
 
   /** Apply formatting to the input strings */
@@ -51,10 +59,16 @@ final case class FormatWithContext(
               (pos - start) -> paragraphs
           }
 
+        val config = Config(
+          maxColumn,
+          blanksBetweenPositionPoints,
+          blanksBetweenPositionGroups,
+        )
+
         Some(localContext)
           .filter(_.nonEmpty).map(
             _.grouped(detailGrouping)
-              .map(Details(_, maxColumn))
+              .map(Details(_, config))
               .flatMap { details =>
                 text +: (0 to (details.end)).map(details.apply)
               }
@@ -77,6 +91,12 @@ object FormatWithContext {
   private type Paragraphs = Iterable[Paragraph]
   private type Position = Int
   private type ContextualDetails = (Position, Paragraphs)
+
+  case class Config(
+      maxColumn: Int,
+      blanksBetweenPositionPoints: Int,
+      blanksBetweenPositionGroups: Int,
+  )
 
   @tailrec
   private def calcLinesAbsPosition(input: Iterable[String], abs: Seq[Int] = Seq.empty): Iterable[(String, Int)] = {
@@ -118,14 +138,14 @@ object FormatWithContext {
 
   private object Details {
 
-    def apply(details: Seq[ContextualDetails], maxColumn: Int) = {
+    def apply(details: Seq[ContextualDetails], config: Config) = {
 
       val initial = details
         .map(_._1)
         .sorted(Ordering[Int].reverse)
         .tails
         .zipWithIndex
-        .map(Detail.create(details.size))
+        .map(Detail.create(details.size, config))
         .filter(_.nonEmpty)
         .toVector
 
@@ -139,8 +159,8 @@ object FormatWithContext {
         for {
           d <- dataAdjusted.sortBy(_.position)
           (_, paragraphs) <- details.find(_._1 == d.position)
-        } yield d.addParagraphs(maxColumn, paragraphs)
-      new Details(adjustParagraphsStart(withParagraphs))
+        } yield d.addParagraphs(paragraphs)
+      new Details(adjustParagraphsStart(withParagraphs, config))
     }
 
     @tailrec
@@ -182,7 +202,7 @@ object FormatWithContext {
     }
 
     @tailrec
-    private def adjustParagraphsStart(dd: Vector[Detail], pos: Int = 0): Vector[Detail] = {
+    private def adjustParagraphsStart(dd: Vector[Detail], config: Config, pos: Int = 0): Vector[Detail] = {
 
       val prior = dd.take(pos)
       val view = dd.view.drop(pos)
@@ -190,16 +210,20 @@ object FormatWithContext {
       val tail = view.tail
 
       val currentStart = d.paragraphsStart
-      val lastContextEnd = prior.lastOption.map(_.end).getOrElse(1)
+      val potentialStart =
+        prior.lastOption.map(_.end).getOrElse(0) + 1 + {
+          if (pos == 0) 0
+          else config.blanksBetweenPositionGroups
+        }
 
-      val target = currentStart max (lastContextEnd + 2) max (d.turns.last + 1)
+      val target = currentStart max potentialStart max (d.turns.last + 1)
       val moveDetailsStart: Detail => Detail =
         d => d.copy(paragraphsStart = d.paragraphsStart + (target - currentStart))
 
       if (pos > dd.size - 2)
         prior :+ moveDetailsStart(d)
       else
-        adjustParagraphsStart(prior ++ (moveDetailsStart(d) +: (tail.map(moveDetailsStart).toVector)), pos + 1)
+        adjustParagraphsStart(prior ++ (moveDetailsStart(d) +: (tail.map(moveDetailsStart).toVector)), config, pos + 1)
     }
   }
 
@@ -208,7 +232,8 @@ object FormatWithContext {
       beams: Vector[Int],
       turns: Vector[Int],
       paragraphsStart: Int,
-      paragraphs: Paragraphs
+      paragraphs: Paragraphs,
+      config: Config,
   ) {
 
     lazy val nonEmpty = positions.nonEmpty
@@ -216,10 +241,10 @@ object FormatWithContext {
     lazy val position = positions.head
     lazy val otherPositions = positions.tail
 
-    def addParagraphs(maxColumn: Int, input: Paragraphs): Detail = {
+    def addParagraphs(input: Paragraphs): Detail = {
       implicit val format =
         ParagraphFormat(
-          maxColumn = maxColumn - beams.last - 3,
+          maxColumn = config.maxColumn - beams.last - 3,
           blanksBetweenLines = 0,
         )
 
@@ -282,7 +307,7 @@ object FormatWithContext {
         else
           paragraph.take(1).map("├─ " + _) ++
             paragraph.drop(1).map("│  " + _) ++
-            Seq("│")
+            Seq.fill(config.blanksBetweenPositionPoints)("│")
       }
     }
 
@@ -297,13 +322,14 @@ object FormatWithContext {
 
   private object Detail {
 
-    def create(groupSize: Int)(t: (Seq[Int], Int)): Detail =
+    def create(groupSize: Int, config: Config)(t: (Seq[Int], Int)): Detail =
       Detail(
-        t._1.toList,
+        positions = t._1.toList,
         beams = t._1.headOption.toVector :+ (t._2 * 2 + 1),
         turns = Vector.empty,
-        ((groupSize - t._2) * 2 - 1),
-        Nil,
+        paragraphsStart = (groupSize - t._2) - 1,
+        paragraphs = Nil,
+        config = config,
       )
 
     implicit val ordering: Ordering[Detail] =
